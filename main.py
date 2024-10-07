@@ -2,6 +2,9 @@ import requests
 import argparse
 from payloads import load_payloads
 import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import queue
 
 # ANSI color codes for terminal output
 RED = '\033[91m'
@@ -20,7 +23,14 @@ syntaxErrors = [
     "SQL syntax"
 ]
 
-foundError = []
+# Event to stop the scan
+stop_event = threading.Event()
+
+# Lock for synchronizing user prompts
+lock = threading.Lock()
+
+# Queue for vulnerabilities to handle them one at a time
+vulnerability_queue = queue.Queue()
 
 def DirectoryFinder(url):
     url = url if url.startswith(('http://', 'https://')) else 'http://' + url
@@ -28,25 +38,25 @@ def DirectoryFinder(url):
     with open(filePath, "r") as file:
         directories = [line.strip() for line in file]
 
-    for dr in directories:
-        test_url = f"{url}/{dr}"
-        try:
-            response = requests.get(test_url, allow_redirects=True, timeout=5)
-            if response.status_code == 200:
-                print(f"Found: {test_url}")
-                foundError.append(test_url)
-                print(foundError)
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(check_directory, url, dr): dr for dr in directories}
 
-            else:
-                print(f"Not found: {test_url}")
+        for future in as_completed(futures):
+            dr = futures[future]
+            try:
+                future.result()  # This will raise any exceptions from the thread
+            except Exception as e:
+                print(f"Error accessing {url}/{dr}: {e}")
 
-        except requests.exceptions.RequestException as e:
-            print(f"Error accessing {test_url}")
-            exit(1)
-
-        except urllib3.exceptions.InsecureRequestWarning:
-            print("error")
-            exit(1)
+def check_directory(url, directory):
+    if stop_event.is_set():
+        return
+    test_url = f"{url}/{directory}"
+    response = requests.get(test_url, allow_redirects=True, timeout=5)
+    if response.status_code == 200:
+        print(f"Found: {test_url}")
+    else:
+        print(f"Not found: {test_url}")
 
 def display_banner():
     print(f"""
@@ -59,38 +69,53 @@ def display_banner():
 """)
 
 def SqlInjectionScanner(url):
+    stop_event.clear()  # Reset the event before scanning
     # Normalize URL: add 'http://' if missing and ensure it ends with a '/'
     url = url if url.startswith(('http://', 'https://')) else 'http://' + url
     url = url.rstrip('/') + '/' if '?' not in url else url
 
-    vulnerabilities_found = 0  # Initialize a counter for vulnerabilities
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(check_sql_injection, url, payload): payload for payload in payloads}
 
-    for payload in payloads:
-        testUrl = f"{url}{payload}"
-        try:
-            response = requests.get(testUrl)
-            if any(error in response.text for error in syntaxErrors):
-                print(f"{GREEN}[*] Vulnerability Found: {RESET}{CYAN}{testUrl}{RESET}")
-                vulnerabilities_found += 1  # Increment the count when a vulnerability is found
-                
-                # Ask if the user wants to continue scanning after finding a vulnerability
-                user_choice = input(f"{YELLOW}Do you want to continue scanning? (y/n): {RESET}")
-                if user_choice.lower() != 'y':
+        for future in as_completed(futures):
+            payload = futures[future]
+            try:
+                future.result()  # This will process each vulnerability found
+            except Exception as e:
+                print(f"{RED}Error during scan with payload {payload}: {RESET}{e}")
+
+def check_sql_injection(url, payload):
+    if stop_event.is_set():
+        return False
+    testUrl = f"{url}{payload}"
+    response = requests.get(testUrl)
+
+    if any(error in response.text for error in syntaxErrors):
+        with lock:  # Acquire the lock for synchronizing user prompts
+            vulnerability_queue.put(testUrl)  # Add to the queue
+        return True  # Indicate a vulnerability was found
+    print(f"{ORANGE}[!] Scanning. Payload: {RESET}{YELLOW}{payload}{RESET}")
+    return False  # Indicate no vulnerability was found
+
+# Function to handle vulnerabilities one by one
+def handle_vulnerabilities():
+    vulnerabilities_found = 0
+    while not stop_event.is_set():
+        # Wait for a vulnerability to be added to the queue
+        if not vulnerability_queue.empty():
+            vulnerability = vulnerability_queue.get()
+            vulnerabilities_found += 1
+            with lock:
+                print(f"{GREEN}[*] Vulnerability Found: {RESET}{CYAN}{vulnerability}{RESET}")
+                user_choice = input(f"{YELLOW}Do you want to continue scanning? (y/n): {RESET}").lower()
+                if user_choice != 'y':
                     print(f"{PURPLE}[*] Stopping scan on user request.{RESET}")
-                    break  # Stop scanning if the user chooses not to continue
-
-            print(f"{ORANGE}[!] Scanning. Payload: {RESET}{YELLOW}{payload}{RESET}")
-
-        except requests.exceptions.RequestException as e:
-            print(f"{RED}Error: {RESET}{e}")
-            exit(1)
-
+                    stop_event.set()  # Signal all threads to stop
+                    break  # Stop further processing
     if vulnerabilities_found == 0:
         print(f"{RED}[*] No Vulnerability found.{RESET}")
     else:
         print(f"{GREEN}[*] Total Vulnerabilities Found: {vulnerabilities_found}{RESET}")
-
-    return vulnerabilities_found > 0  # Return True if any vulnerabilities found, otherwise False
 
 if __name__ == "__main__":
     # Argument parser for command-line options
@@ -101,4 +126,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     display_banner()
-    SqlInjectionScanner(args.url)
+
+    # Run the scanner in a thread
+    scan_thread = threading.Thread(target=SqlInjectionScanner, args=(args.url,))
+    scan_thread.start()
+
+    # Handle vulnerabilities in the main thread, one at a time
+    handle_vulnerabilities()
+
+    # Wait for the scan thread to finish
+    scan_thread.join()
